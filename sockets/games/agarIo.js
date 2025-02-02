@@ -6,18 +6,13 @@
 const WORLD_WIDTH = 1080;
 const WORLD_HEIGHT = 1080;
 
-/** Server update rate in milliseconds */
-const TICK_RATE = 45; // ~60 FPS updates
+/** Tick rates (reduced to 30 FPS for stability) */
+const SIMULATION_RATE = 30; // simulation updates per second
+const BROADCAST_RATE = 30; // broadcast updates per second
 
-// We'll dynamically load RBush:
-let RBush;
-(async () => {
-  const rbushModule = await import("rbush");
-  RBush = rbushModule.default;
-})();
-
+// A fast clamp function using ternaries.
 function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
+  return value < min ? min : value > max ? max : value;
 }
 
 /**
@@ -27,88 +22,76 @@ function clamp(value, min, max) {
  * @param {Object} room - The room object to start.
  * @param {Object} games - The master games object.
  */
-async function startAgarIoRoom(game, room, games) {
-  // Wait for RBush to be loaded if not already
-  if (!RBush) {
-    const rbushModule = await import("rbush");
-    RBush = rbushModule.default;
-  }
+function startAgarIoRoom(game, room, games) {
+  console.log(`[Server] Starting Agar.io room, roomId=${room.id}`);
 
-  console.log(
-    `[Server] startAgarIoRoom (Agar.io) -> Setting initial positions for roomId=${room.id}`
-  );
-
-  // Initialize players as a Map for O(1) access
+  // Initialize players using a Map for O(1) access.
   room.playersMap = new Map();
   room.alivePlayers = new Set();
 
   room.players.forEach((player) => {
-    player.x = Math.floor(Math.random() * WORLD_WIDTH);
-    player.y = Math.floor(Math.random() * WORLD_HEIGHT);
+    // Use bitwise operators to convert to an integer quickly.
+    player.x = ~~(Math.random() * WORLD_WIDTH);
+    player.y = ~~(Math.random() * WORLD_HEIGHT);
     player.mass = 10;
     player.isDead = false;
     player.lastDx = 0;
     player.lastDy = 0;
-
     room.playersMap.set(player.socketId, player);
     room.alivePlayers.add(player.socketId);
   });
 
-  // No food in this variant
-
-  // Initialize bullets array and object pool
+  // Initialize bullets array and bullet pool.
   room.bullets = [];
   room.bulletIdCounter = 1;
   room.bulletPool = [];
 
-  // Initialize spatial index
-  room.playerSpatialIndex = new RBush();
-  room.playersMap.forEach((player) => {
-    room.playerSpatialIndex.insert({
-      minX: player.x - player.mass,
-      minY: player.y - player.mass,
-      maxX: player.x + player.mass,
-      maxY: player.y + player.mass,
-      player,
-    });
-  });
-
-  // Clear any existing intervals
-  if (room.bulletInterval) {
-    clearInterval(room.bulletInterval);
+  // Clear any existing intervals.
+  if (room.simulationInterval) {
+    clearInterval(room.simulationInterval);
     console.log(
-      `[Server] Cleared existing bulletInterval for roomId=${room.id}`
+      `[Server] Cleared previous simulationInterval for roomId=${room.id}`
+    );
+  }
+  if (room.broadcastInterval) {
+    clearInterval(room.broadcastInterval);
+    console.log(
+      `[Server] Cleared previous broadcastInterval for roomId=${room.id}`
     );
   }
 
-  // Start the bullet update loop
-  room.bulletInterval = setInterval(() => {
+  // Start the simulation update loop at 30 FPS.
+  room.simulationInterval = setInterval(() => {
     updateBullets(game, room, games);
+    // (Any additional simulation updates could be added here.)
+  }, 1000 / SIMULATION_RATE);
+
+  // Start the broadcast loop at 30 FPS.
+  room.broadcastInterval = setInterval(() => {
     broadcastGameState(game.io, game.id, room.id, room);
-  }, 1000 / TICK_RATE);
+  }, 1000 / BROADCAST_RATE);
 
   room.winner = null;
-  console.log(`[Server] Started game loop for roomId=${room.id}`);
+  console.log(`[Server] Game loop started for roomId=${room.id}`);
 }
 
 /**
- * Broadcast the entire Agar.io room state (players + bullets).
+ * Broadcast the entire game state (players and bullets).
  */
 function broadcastGameState(io, gameId, roomId, room) {
   if (!io) return;
   const channel = `${gameId}-${roomId}`;
 
-  const alivePlayers = Array.from(room.alivePlayers).map((socketId) =>
-    room.playersMap.get(socketId)
-  );
-
-  const playersData = alivePlayers.map((p) => ({
-    socketId: p.socketId,
-    userName: p.userName,
-    x: p.x,
-    y: p.y,
-    mass: p.mass,
-  }));
+  const playersData = Array.from(room.alivePlayers).map((socketId) => {
+    const p = room.playersMap.get(socketId);
+    return {
+      socketId: p.socketId,
+      userName: p.userName,
+      x: p.x,
+      y: p.y,
+      mass: p.mass,
+    };
+  });
 
   const bulletsData = room.bullets.map((b) => ({
     id: b.id,
@@ -128,7 +111,7 @@ function broadcastGameState(io, gameId, roomId, room) {
 }
 
 /**
- * Handle player movement from the client (Agar.io).
+ * Handle player movement from the client.
  */
 function handlePlayerMove(io, games, data) {
   const { gameId, roomId, socket, direction } = data;
@@ -138,13 +121,12 @@ function handlePlayerMove(io, games, data) {
   const room = game.activeRooms[roomId] || game.rooms[roomId];
   if (!room) return;
 
-  const player = room.playersMap?.get(socket.id);
+  const player = room.playersMap.get(socket.id);
   if (!player || player.isDead) return;
 
-  const step = 4; // movement speed
-  let dx = 0;
-  let dy = 0;
-
+  const step = 4;
+  let dx = 0,
+    dy = 0;
   switch (direction) {
     case "up-left":
       dx = -step;
@@ -175,44 +157,21 @@ function handlePlayerMove(io, games, data) {
       dx = step;
       break;
     default:
-      dx = 0;
-      dy = 0;
+      break;
   }
 
-  const oldX = player.x;
-  const oldY = player.y;
   player.x = clamp(player.x + dx, 0, WORLD_WIDTH);
   player.y = clamp(player.y + dy, 0, WORLD_HEIGHT);
 
-  if (dx !== 0 || dy !== 0) {
-    room.playerSpatialIndex.remove(
-      {
-        minX: oldX - player.mass,
-        minY: oldY - player.mass,
-        maxX: oldX + player.mass,
-        maxY: oldY + player.mass,
-        player,
-      },
-      (a, b) => a.player.socketId === b.player.socketId
-    );
-    room.playerSpatialIndex.insert({
-      minX: player.x - player.mass,
-      minY: player.y - player.mass,
-      maxX: player.x + player.mass,
-      maxY: player.y + player.mass,
-      player,
-    });
-
-    // Store last direction for bullet logic
+  if (dx || dy) {
     player.lastDx = dx;
     player.lastDy = dy;
   }
-
-  broadcastGameState(io, gameId, roomId, room);
+  // Note: We avoid immediate broadcasts to reduce per-action load.
 }
 
 /**
- * Handle shooting bullets (Agar.io).
+ * Handle shooting a bullet.
  */
 function handleShootBullet(io, games, data) {
   const { gameId, roomId, socket, bulletType, direction } = data;
@@ -222,17 +181,16 @@ function handleShootBullet(io, games, data) {
   const room = game.activeRooms[roomId] || game.rooms[roomId];
   if (!room) return;
 
-  const player = room.playersMap?.get(socket.id);
+  const player = room.playersMap.get(socket.id);
   if (!player || player.isDead) return;
 
-  // Basic validation
   if (
     !direction ||
     typeof direction.x !== "number" ||
     typeof direction.y !== "number" ||
     !["charged", "fullyCharged"].includes(bulletType)
   ) {
-    return; // Invalid data
+    return;
   }
 
   let speedValue, radius, rangeLimit;
@@ -251,11 +209,10 @@ function handleShootBullet(io, games, data) {
       return;
   }
 
-  // Normalize direction
-  const length =
+  const len =
     Math.sqrt(direction.x * direction.x + direction.y * direction.y) || 1;
-  const vx = (direction.x / length) * speedValue;
-  const vy = (direction.y / length) * speedValue;
+  const vx = (direction.x / len) * speedValue;
+  const vy = (direction.y / len) * speedValue;
 
   let bullet;
   if (room.bulletPool.length > 0) {
@@ -270,6 +227,7 @@ function handleShootBullet(io, games, data) {
     bullet.traveled = 0;
     bullet.rangeLimit = rangeLimit;
     bullet.type = bulletType;
+    bullet.speed = speedValue;
   } else {
     bullet = {
       id: room.bulletIdCounter++,
@@ -282,16 +240,16 @@ function handleShootBullet(io, games, data) {
       traveled: 0,
       rangeLimit,
       type: bulletType,
+      speed: speedValue,
     };
   }
 
   room.bullets.push(bullet);
-
   io.to(`${game.id}-${room.id}`).emit("bulletCreated", bullet);
 }
 
 /**
- * Periodic bullet updates: movement, collisions, etc.
+ * Update bullets: move them, check for collisions, and recycle them.
  */
 function updateBullets(game, room, games) {
   if (!room.bullets || !room.playersMap) return;
@@ -300,12 +258,9 @@ function updateBullets(game, room, games) {
     const b = room.bullets[i];
     b.x += b.vx;
     b.y += b.vy;
+    // Use the precomputed speed to update the distance traveled.
+    b.traveled += b.speed;
 
-    // Distance traveled
-    const distSq = b.vx * b.vx + b.vy * b.vy;
-    b.traveled += Math.sqrt(distSq);
-
-    // Out of bounds or range limit
     if (
       b.x < 0 ||
       b.x > WORLD_WIDTH ||
@@ -318,58 +273,31 @@ function updateBullets(game, room, games) {
       continue;
     }
 
-    // Potential collisions
-    const hits = room.playerSpatialIndex.search({
-      minX: b.x - b.radius,
-      minY: b.y - b.radius,
-      maxX: b.x + b.radius,
-      maxY: b.y + b.radius,
-    });
-
     let collisionDetected = false;
-    for (const item of hits) {
-      const player = item.player;
+    for (const player of room.playersMap.values()) {
       if (player.socketId === b.ownerId || player.isDead) continue;
-
       const dx = b.x - player.x;
       const dy = b.y - player.y;
-      const distSq = dx * dx + dy * dy;
-      const collisionDist = b.radius + player.mass;
-      if (distSq < collisionDist * collisionDist) {
+      const collisionDistance = b.radius + player.mass;
+      if (dx * dx + dy * dy < collisionDistance * collisionDistance) {
         player.isDead = true;
         room.alivePlayers.delete(player.socketId);
-
         room.bulletPool.push(b);
         room.bullets.splice(i, 1);
-
-        // Remove from spatial index
-        room.playerSpatialIndex.remove(
-          {
-            minX: player.x - player.mass,
-            minY: player.y - player.mass,
-            maxX: player.x + player.mass,
-            maxY: player.y + player.mass,
-            player,
-          },
-          (a, b) => a.player.socketId === b.player.socketId
-        );
-
-        collisionDetected = true;
         console.log(
           `[Server] Player ${player.userName} was killed by bullet ${b.id}`
         );
+        collisionDetected = true;
         break;
       }
     }
-    if (collisionDetected) {
-      continue;
-    }
+    if (collisionDetected) continue;
   }
 
-  // Check if 0 or 1 players left
+  // Check win condition (0 or 1 player left).
   if (room.alivePlayers.size <= 1 && !room.winner) {
     if (room.alivePlayers.size === 1) {
-      const winnerId = [...room.alivePlayers][0];
+      const winnerId = Array.from(room.alivePlayers)[0];
       const winnerPlayer = room.playersMap.get(winnerId);
       room.winner = winnerPlayer ? winnerPlayer.userName : null;
       console.log(`[Server] Player ${room.winner} has won roomId=${room.id}`);
@@ -377,21 +305,25 @@ function updateBullets(game, room, games) {
       room.winner = null;
       console.log(`[Server] No players left alive in roomId=${room.id}`);
     }
-
     endAgarIoRoom(game, room, games);
   }
 }
 
 /**
- * Cleanup function for Agar.io
+ * Cleanup the game room and notify clients.
  */
 function endAgarIoRoom(game, room, games) {
   console.log(`[Server] Ending Agar.io room: ${room.id}`);
 
-  if (room.bulletInterval) {
-    clearInterval(room.bulletInterval);
-    room.bulletInterval = null;
-    console.log(`[Server] Cleared bulletInterval for roomId=${room.id}`);
+  if (room.simulationInterval) {
+    clearInterval(room.simulationInterval);
+    room.simulationInterval = null;
+    console.log(`[Server] Cleared simulationInterval for roomId=${room.id}`);
+  }
+  if (room.broadcastInterval) {
+    clearInterval(room.broadcastInterval);
+    room.broadcastInterval = null;
+    console.log(`[Server] Cleared broadcastInterval for roomId=${room.id}`);
   }
 
   if (room.bullets) {
@@ -400,23 +332,21 @@ function endAgarIoRoom(game, room, games) {
   }
 
   if (room.playersMap) {
-    // Optionally reset states, or just remove everything
     room.playersMap.forEach((player) => {
       player.isDead = false;
       player.mass = 10;
     });
   }
 
-  // Remove from activeRooms
   if (game.activeRooms[room.id]) {
     delete game.activeRooms[room.id];
     console.log(`[Server] Removed roomId=${room.id} from activeRooms`);
   }
 
-  // Notify clients
-  game.io
-    .to(`${game.id}-${room.id}`)
-    .emit("gameEnded", { roomId: room.id, winner: room.winner });
+  game.io.to(`${game.id}-${room.id}`).emit("gameEnded", {
+    roomId: room.id,
+    winner: room.winner,
+  });
 }
 
 module.exports = {
@@ -427,5 +357,6 @@ module.exports = {
   endAgarIoRoom,
   WORLD_WIDTH,
   WORLD_HEIGHT,
-  TICK_RATE,
+  SIMULATION_RATE,
+  BROADCAST_RATE,
 };
